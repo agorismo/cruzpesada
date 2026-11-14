@@ -85,6 +85,8 @@ struct Estado {
     visor_aberto: bool,
     emergencia: String,
     desempenho_ativo: bool,
+    gpu_filho: Option<Child>,
+    gpu_ultima: Option<(u32, Vec<(u32, u32)>)>,
     atualizando: bool,
     aparelho: String,
     riscos_seg: Option<(Instant, u32)>,
@@ -625,7 +627,7 @@ fn som_parar(app: AppHandle, state: State<Shared>) {
 // Desliga o "Não perturbe" (o processo "silencio" volta ao normal ao fechar a entrada).
 fn ligar_silencio_interno(est: &mut Estado, sim: bool) {
     if !sim {
-        if let Some(mut c) = est.silencio.take() { drop(c.stdin.take()); let _ = c.kill(); let _ = c.wait(); }
+        if let Some(c) = est.silencio.take() { encerrar_helper(c); }
     }
 }
 
@@ -666,7 +668,19 @@ fn tecla_pode_aparecer(nome: &str) -> bool {
 }
 
 fn parar_teclas(est: &mut Estado) {
-    if let Some(mut c) = est.teclas.take() { drop(c.stdin.take()); let _ = c.kill(); let _ = c.wait(); }
+    if let Some(c) = est.teclas.take() { encerrar_helper(c); }
+}
+
+// Os ajudantes (astra-audio.exe "silencio" e "teclas") desfazem o que fizeram quando o stdin fecha.
+// Por isso fechamos o stdin primeiro e só matamos o processo se ele não sair sozinho.
+fn encerrar_helper(mut c: Child) {
+    drop(c.stdin.take());
+    for _ in 0..10 {
+        if matches!(c.try_wait(), Ok(Some(_))) { return; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
 }
 
 #[tauri::command]
@@ -888,36 +902,114 @@ fn popup_vazio(app: AppHandle) {
 }
 
 // ---------- painel de desempenho ----------
+// CPU e RAM vêm do sysinfo. A GPU vem do astra-audio.exe "desempenho" (linhas "GPU <total> pid:valor...").
+static DESEMPENHO_LOOP: AtomicBool = AtomicBool::new(false);
+
 #[tauri::command]
 fn desempenho(ligado: bool, app: AppHandle, state: State<Shared>) {
-    {
-        let mut est = state.lock().unwrap();
-        est.desempenho_ativo = ligado;
+    let mut est = state.lock().unwrap();
+    est.desempenho_ativo = ligado;
+    if !ligado {
+        if let Some(c) = est.gpu_filho.take() { encerrar_helper(c); }
+        est.gpu_ultima = None;
+        return;
     }
-    if !ligado { return; }
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        use sysinfo::{Pid, System};
-        let mut sys = System::new_all();
-        let eu = Pid::from_u32(std::process::id());
-        loop {
-            if !app2.state::<Shared>().lock().unwrap().desempenho_ativo { break; }
-            sys.refresh_all();
-            let (cpu_eu, ram_eu) = sys.process(eu).map(|p| (p.cpu_usage(), p.memory())).unwrap_or((0.0, 0));
-            let dados = json!({
-                // TODO: GPU ainda não medida (no Electron vinha do astra-audio "desempenho").
-                "app": { "cpu": cpu_eu.round(), "ram": ram_eu / 1_048_576, "gpu": null, "ramGpu": 0 },
-                "pc": {
-                    "cpu": sys.global_cpu_usage().round(),
-                    "ramUsada": sys.used_memory() / 1_048_576,
-                    "ramTotal": sys.total_memory() / 1_048_576,
-                    "gpu": null
+
+    // Helper da GPU (uma vez só).
+    if est.gpu_filho.is_none() {
+        if let Some(exe) = caminho_capturador(&app) {
+            let mut cmd = Command::new(exe);
+            cmd.arg("desempenho").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000);
+            if let Ok(mut filho) = cmd.spawn() {
+                if let Some(saida) = filho.stdout.take() {
+                    let app2 = app.clone();
+                    std::thread::spawn(move || {
+                        for linha in BufReader::new(saida).lines().map_while(Result::ok) {
+                            let Some(resto) = linha.strip_prefix("GPU ") else { continue };
+                            let mut partes = resto.split_whitespace();
+                            let total: u32 = partes.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+                            let pids: Vec<(u32, u32)> = partes
+                                .filter_map(|p| {
+                                    let (a, b) = p.split_once(':')?;
+                                    Some((a.parse().ok()?, b.parse().ok()?))
+                                })
+                                .collect();
+                            app2.state::<Shared>().lock().unwrap().gpu_ultima = Some((total, pids));
+                        }
+                    });
                 }
-            });
-            let _ = app2.emit_to("main", "desempenho-dados", dados);
-            std::thread::sleep(Duration::from_secs(2));
+                est.gpu_filho = Some(filho);
+            }
         }
-    });
+    }
+
+    // Laço que manda os números para a página (um só, mesmo se o painel abrir e fechar).
+    if !DESEMPENHO_LOOP.swap(true, Ordering::SeqCst) {
+        let app3 = app.clone();
+        std::thread::spawn(move || {
+            use sysinfo::{Pid, System};
+            let mut sys = System::new_all();
+            let eu = std::process::id();
+            loop {
+                let ativo = app3.state::<Shared>().lock().unwrap().desempenho_ativo;
+                if !ativo { break; }
+                sys.refresh_all();
+
+                // Eu + os processos filhos (o WebView2 roda como filho do programa).
+                let mut pids: Vec<u32> = sys
+                    .processes()
+                    .iter()
+                    .filter(|(_, p)| p.parent().map(|pp| pp.as_u32()) == Some(eu))
+                    .map(|(pid, _)| pid.as_u32())
+                    .collect();
+                pids.push(eu);
+
+                let mut cpu_app = 0f32;
+                let mut ram_app = 0u64;
+                for pid in &pids {
+                    if let Some(p) = sys.process(Pid::from_u32(*pid)) {
+                        cpu_app += p.cpu_usage();
+                        ram_app += p.memory();
+                    }
+                }
+                let (gpu_pc, gpu_pids) = app3
+                    .state::<Shared>()
+                    .lock()
+                    .unwrap()
+                    .gpu_ultima
+                    .clone()
+                    .map_or((None, Vec::new()), |(t, p)| (Some(t), p));
+                let gpu_app: Option<u32> = gpu_pc.map(|_| {
+                    gpu_pids
+                        .iter()
+                        .filter(|(pid, _)| pids.contains(pid))
+                        .map(|(_, v)| *v)
+                        .sum::<u32>()
+                        .min(100)
+                });
+
+                let dados = json!({
+                    "app": {
+                        "cpu": (cpu_app / sys.cpus().len().max(1) as f32).round(),
+                        "ram": ram_app / 1_048_576,
+                        "gpu": gpu_app,
+                        "ramGpu": 0
+                    },
+                    "pc": {
+                        "cpu": sys.global_cpu_usage().round(),
+                        "ramUsada": sys.used_memory() / 1_048_576,
+                        "ramTotal": sys.total_memory() / 1_048_576,
+                        "gpu": gpu_pc
+                    }
+                });
+                let _ = app3.emit_to("main", "desempenho-dados", dados);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            DESEMPENHO_LOOP.store(false, Ordering::SeqCst);
+        });
+    }
 }
 
 // ---------- sair / reiniciar ----------
@@ -925,6 +1017,7 @@ fn parar_tudo(est: &mut Estado) {
     parar_capturador(est);
     parar_teclas(est);
     ligar_silencio_interno(est, false);
+    if let Some(c) = est.gpu_filho.take() { encerrar_helper(c); }
 }
 
 fn sair(app: &AppHandle) {
