@@ -94,7 +94,7 @@ struct Estado {
 }
 type Shared = Mutex<Estado>;
 
-fn tocou(est: &Estado) -> bool {
+fn toque_recente(est: &Estado) -> bool {
     est.ultimo_toque.map_or(false, |t| t.elapsed() < TOQUE_VALE)
 }
 fn captura_recente(est: &Estado) -> bool {
@@ -448,7 +448,7 @@ fn marcar_configurado(app: &AppHandle) {
 #[tauri::command]
 fn listar_fontes(app: AppHandle, state: State<Shared>) -> Vec<Fonte> {
     let mut est = state.lock().unwrap();
-    if !tocou(&est) { return vec![]; }
+    if !toque_recente(&est) { return vec![]; }
     let monitores = app.get_webview_window("main")
         .and_then(|w| w.available_monitors().ok())
         .unwrap_or_default();
@@ -473,7 +473,7 @@ struct Escolha {
 #[tauri::command]
 fn definir_fonte(escolha: Escolha, state: State<Shared>) -> bool {
     let mut est = state.lock().unwrap();
-    if !tocou(&est) {
+    if !toque_recente(&est) {
         est.fonte_escolhida = None;
         return false;
     }
