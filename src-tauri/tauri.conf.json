@@ -20,7 +20,7 @@
     "resources": ["resources/astra-audio.exe"],
     "windows": {
       "nsis": {
-        "installMode": "perUser"
+        "installMode": "currentUser"
       }
     }
   }
